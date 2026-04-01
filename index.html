@@ -1,0 +1,1144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Abyssal Spores</title>
+  <style>
+    html, body { margin: 0; padding: 0; overflow: hidden; background: #000; }
+    canvas { display: block; }
+    /* ── Dev Mode UI ── */
+    #devPanel {
+      display: none;
+      position: fixed; top: 10px; right: 10px;
+      background: rgba(0,0,0,0.75);
+      border: 1px solid #ff0;
+      color: #ff0;
+      font: 13px monospace;
+      padding: 10px 14px;
+      border-radius: 6px;
+      z-index: 100;
+      user-select: none;
+    }
+    #devPanel.visible { display: block; }
+    #devPanel label { display: block; margin-top: 6px; }
+    #devPanel input[type=range] { width: 140px; vertical-align: middle; }
+  </style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+
+<!-- ── Developer Panel ── -->
+<div id="devPanel">
+  <strong>DEV MODE</strong>
+  <label>
+    Time Speed: <span id="speedLabel">1x</span><br>
+    <input type="range" id="speedSlider" min="1" max="10" value="1" step="1">
+  </label>
+  <label style="margin-top:8px;font-size:11px;color:#aaa;">
+    Invincible ON &nbsp;|&nbsp; Fast spawn ON
+  </label>
+</div>
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx    = canvas.getContext('2d');
+
+// ── Developer Mode ────────────────────────────────────────────
+// Set DEV_MODE = true to enable: invincibility + fast spawn + time slider
+const DEV_MODE = false;
+
+// Dev panel wiring (only active when DEV_MODE = true)
+let devTimeScale = 1;
+(function initDevPanel() {
+  if (!DEV_MODE) return;
+  const panel  = document.getElementById('devPanel');
+  const slider = document.getElementById('speedSlider');
+  const label  = document.getElementById('speedLabel');
+  panel.classList.add('visible');
+  slider.addEventListener('input', () => {
+    devTimeScale = parseInt(slider.value);
+    label.textContent = devTimeScale + 'x';
+  });
+})();
+
+// ── Constants ─────────────────────────────────────────────────
+const GRAVITY_WINDOW  = 5;   // seconds of ceasefire before nutrients attract
+const NUTRIENT_LIFE   = 30;  // seconds before nutrient disappears
+const BG_COUNT        = 360;
+
+// ── Global arrays ─────────────────────────────────────────────
+const spores     = [];
+const aoeFlashes = [];
+const explosions = [];
+const nutrients  = [];
+const enemies    = [];
+const bgParticles = [];
+
+// ── Global state ──────────────────────────────────────────────
+let survivalTime    = 0;
+let ceasefireTimer  = 0;
+let attracting      = false;  // once triggered, stays true until all nutrients absorbed
+let gameState       = 'RUNNING';
+let mouseX = 0, mouseY = 0;
+let lastTime = 0;
+const mouseButtons = new Set();
+
+// ── Canvas resize ─────────────────────────────────────────────
+function resizeCanvas() {
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+// ── Draw helpers ──────────────────────────────────────────────
+function drawRing(x, y, radius, color, glowBlur, lineWidth) {
+  ctx.save();
+  ctx.shadowBlur  = glowBlur || 0;
+  ctx.shadowColor = color;
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = lineWidth || 2;
+  ctx.beginPath();
+  ctx.arc(x, y, Math.max(0.5, radius), 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Multi-layer soft bloom circle (used for player and spores)
+function drawGlowCircle(x, y, r, color, glowSize) {
+  ctx.save();
+  ctx.shadowBlur  = glowSize * 2.5;
+  ctx.shadowColor = color;
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+  ctx.lineWidth   = r * 0.9;
+  ctx.beginPath();
+  ctx.arc(x, y, r * 0.6, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.save();
+  ctx.shadowBlur  = glowSize * 1.2;
+  ctx.shadowColor = color;
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+  ctx.lineWidth   = r * 0.55;
+  ctx.beginPath();
+  ctx.arc(x, y, r * 0.55, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.save();
+  ctx.shadowBlur  = glowSize * 0.7;
+  ctx.shadowColor = color;
+  ctx.strokeStyle = '#FFFFFF';
+  ctx.lineWidth   = r * 0.45;
+  ctx.beginPath();
+  ctx.arc(x, y, r * 0.5, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Diamond shape helper (used for shuttles)
+function drawDiamondShape(cx, cy, sx, sy, fillColor, strokeColor, strokeW, blur) {
+  ctx.save();
+  ctx.shadowBlur  = blur;
+  ctx.shadowColor = strokeColor || fillColor;
+  ctx.beginPath();
+  ctx.moveTo(cx,      cy - sy);
+  ctx.lineTo(cx + sx, cy);
+  ctx.lineTo(cx,      cy + sy);
+  ctx.lineTo(cx - sx, cy);
+  ctx.closePath();
+  if (fillColor) { ctx.fillStyle = fillColor; ctx.fill(); }
+  if (strokeColor && strokeW > 0) { ctx.strokeStyle = strokeColor; ctx.lineWidth = strokeW; ctx.stroke(); }
+  ctx.restore();
+}
+
+// Devourer segment helper
+function drawDevourerSegment(x, y, r, alpha) {
+  if (r < 1) return;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  // Outer soft bloom
+  ctx.shadowBlur  = r * 2.5; ctx.shadowColor = '#00FF00';
+  ctx.strokeStyle = 'rgba(0,255,0,0.15)'; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke();
+  // Mid glow
+  ctx.shadowBlur  = r * 1.2;
+  ctx.strokeStyle = 'rgba(0,255,0,0.4)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke();
+  // Crisp ring
+  ctx.shadowBlur  = r * 0.5;
+  ctx.strokeStyle = '#00FF00'; ctx.lineWidth = Math.max(1, r * 0.12);
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke();
+  ctx.restore();
+}
+
+// Jellyfish helpers
+function jfGline(x1,y1,x2,y2,lw,blur,alpha) {
+  ctx.save();
+  ctx.shadowBlur=blur; ctx.shadowColor='#00FFFF';
+  ctx.strokeStyle=`rgba(0,255,255,${alpha})`; ctx.lineWidth=lw;
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+  ctx.restore();
+}
+function jfGcircle(x,y,r,alpha) {
+  ctx.save();
+  ctx.shadowBlur=10; ctx.shadowColor='#00FFFF';
+  ctx.strokeStyle=`rgba(0,255,255,${alpha})`; ctx.lineWidth=1.2;
+  ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.stroke();
+  ctx.restore();
+}
+
+function dist(ax, ay, bx, by) {
+  const dx = ax - bx, dy = ay - by;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+function circlesOverlap(a, b) {
+  return dist(a.x, a.y, b.x, b.y) < a.radius + b.radius;
+}
+
+// ── Background particles ──────────────────────────────────────
+function initBgParticles() {
+  bgParticles.length = 0;
+  for (let i = 0; i < BG_COUNT; i++) {
+    bgParticles.push({
+      x: Math.random() * canvas.width,
+      y: Math.random() * canvas.height,
+      vx: (Math.random() - 0.5) * 20,
+      vy: (Math.random() - 0.5) * 20,
+      r: 1 + Math.random() * 1.5,
+      alpha: 0.15 + Math.random() * 0.25
+    });
+  }
+}
+
+function updateBgParticles(dt) {
+  for (let i = 0; i < bgParticles.length; i++) {
+    const p = bgParticles[i];
+    // Brownian nudge
+    p.vx += (Math.random() - 0.5) * 30 * dt;
+    p.vy += (Math.random() - 0.5) * 30 * dt;
+    // Dampen
+    p.vx *= 0.97;
+    p.vy *= 0.97;
+    p.x  += p.vx * dt;
+    p.y  += p.vy * dt;
+    // Wrap
+    if (p.x < 0) p.x += canvas.width;
+    else if (p.x > canvas.width)  p.x -= canvas.width;
+    if (p.y < 0) p.y += canvas.height;
+    else if (p.y > canvas.height) p.y -= canvas.height;
+
+    // Repel from player
+    const dp = dist(p.x, p.y, player.x, player.y);
+    const pr = player.radius + p.r + 10;
+    if (dp < pr && dp > 0) {
+      const f = (pr - dp) * 4;
+      p.vx += (p.x - player.x) / dp * f;
+      p.vy += (p.y - player.y) / dp * f;
+    }
+    // Repel from enemies
+    for (let j = 0; j < enemies.length; j++) {
+      const e = enemies[j];
+      if (!e.active) continue;
+      const de = dist(p.x, p.y, e.x, e.y);
+      const er = e.radius + p.r + 6;
+      if (de < er && de > 0) {
+        const f = (er - de) * 2;
+        p.vx += (p.x - e.x) / de * f;
+        p.vy += (p.y - e.y) / de * f;
+      }
+    }
+  }
+}
+
+function drawBgParticles() {
+  ctx.save();
+  for (let i = 0; i < bgParticles.length; i++) {
+    const p = bgParticles[i];
+    ctx.globalAlpha = p.alpha;
+    ctx.fillStyle   = '#3a5a6a';
+    ctx.shadowBlur  = 3;
+    ctx.shadowColor = '#4488aa';
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+// ── Player trail ──────────────────────────────────────────────
+const playerTrail = [];
+
+function spawnPlayerTrail() {
+  const spd = Math.sqrt(
+    (player.vx || 0) * (player.vx || 0) + (player.vy || 0) * (player.vy || 0)
+  );
+  if (spd < 20) return;
+  for (let i = 0; i < 2; i++) {
+    const angle = Math.atan2(player.vy || 0, player.vx || 0) + Math.PI + (Math.random()-0.5)*0.5;
+    playerTrail.push({
+      x: player.x + (Math.random()-0.5)*player.radius,
+      y: player.y + (Math.random()-0.5)*player.radius,
+      vx: Math.cos(angle)*(30+Math.random()*50),
+      vy: Math.sin(angle)*(30+Math.random()*50),
+      life: 0.35+Math.random()*0.25,
+      maxLife: 0.35+Math.random()*0.25,
+      r: 1.5+Math.random()*2
+    });
+  }
+}
+
+// ── Player ────────────────────────────────────────────────────
+const player = {
+  x: 0, y: 0,
+  radius: 10,
+  speed: 300,
+  frenzyTimer: 0,
+  nutrientCount: 0,
+  aoeCooldown: 0,
+  firedThisFrame: false,
+  vx: 0, vy: 0,
+  keys: new Set(),
+
+  init() {
+    this.x = canvas.width  / 2;
+    this.y = canvas.height / 2;
+    this.frenzyTimer    = 0;
+    this.nutrientCount  = 0;
+    this.aoeCooldown    = 0;
+    this.firedThisFrame = false;
+    this.vx = 0; this.vy = 0;
+    playerTrail.length = 0;
+  },
+
+  update(dt) {
+    let dx = 0, dy = 0;
+    if (this.keys.has('w') || this.keys.has('arrowup'))    dy -= 1;
+    if (this.keys.has('s') || this.keys.has('arrowdown'))  dy += 1;
+    if (this.keys.has('a') || this.keys.has('arrowleft'))  dx -= 1;
+    if (this.keys.has('d') || this.keys.has('arrowright')) dx += 1;
+    if (dx !== 0 && dy !== 0) {
+      const inv = 1 / Math.sqrt(2);
+      dx *= inv; dy *= inv;
+    }
+    this.vx = dx * this.speed;
+    this.vy = dy * this.speed;
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+    this.x = Math.max(this.radius, Math.min(canvas.width  - this.radius, this.x));
+    this.y = Math.max(this.radius, Math.min(canvas.height - this.radius, this.y));
+    if (this.frenzyTimer > 0) this.frenzyTimer = Math.max(0, this.frenzyTimer - dt);
+    if (this.aoeCooldown > 0) this.aoeCooldown = Math.max(0, this.aoeCooldown - dt);
+  },
+
+  draw() {
+    // Update & draw trail
+    spawnPlayerTrail();
+    for (let i = playerTrail.length - 1; i >= 0; i--) {
+      const p = playerTrail[i];
+      p.life -= 0.016; // approximate dt
+      if (p.life <= 0) { playerTrail.splice(i, 1); continue; }
+      p.x += p.vx * 0.016; p.y += p.vy * 0.016;
+      p.vx *= 0.90; p.vy *= 0.90;
+      const alpha = (p.life / p.maxLife) * 0.6;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.shadowBlur = 8; ctx.shadowColor = '#FFFFFF';
+      ctx.fillStyle = '#FFFFFF';
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r * (p.life / p.maxLife), 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+    const glowSize = this.frenzyTimer > 0 ? 35 : 25;
+    drawGlowCircle(this.x, this.y, this.radius, '#FFFFFF', glowSize);
+  }
+};
+
+window.addEventListener('keydown', e => player.keys.add(e.key.toLowerCase()));
+window.addEventListener('keyup',   e => player.keys.delete(e.key.toLowerCase()));
+
+// ── Spore ─────────────────────────────────────────────────────
+class Spore {
+  constructor(x, y, vx, vy, damage) {
+    this.x = x; this.y = y;
+    this.vx = vx; this.vy = vy;
+    this.radius = 4;
+    this.damage = damage || 1;
+    this.active = true;
+  }
+  update(dt) {
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+    if (this.x < -50 || this.x > canvas.width  + 50 ||
+        this.y < -50 || this.y > canvas.height + 50) {
+      this.active = false;
+    }
+  }
+  draw() {
+    drawGlowCircle(this.x, this.y, this.radius, '#FFFFFF', 14);
+  }
+}
+
+// ── Nutrient ──────────────────────────────────────────────────
+class Nutrient {
+  constructor(x, y) {
+    this.x = x; this.y = y;
+    this.radius = 5;
+    this.age    = 0;
+    this.active = true;
+    this.vx = 0; this.vy = 0;
+  }
+  update(dt) {
+    this.age += dt;
+    if (this.age >= NUTRIENT_LIFE) { this.active = false; return; }
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+  }
+  draw() {
+    const alpha = Math.max(0, 1 - this.age / NUTRIENT_LIFE);
+    if (alpha <= 0) return;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    drawRing(this.x, this.y, this.radius, '#FFFF00', 18, 2);
+    ctx.restore();
+  }
+}
+
+// ── ShuttleSmall ──────────────────────────────────────────────
+class ShuttleSmall {
+  constructor(x, y) {
+    this.x = x; this.y = y;
+    this.radius = 15;
+    this.hp     = 1;
+    this.active = true;
+    this.vx = (Math.random() - 0.5) * 80;
+    this.vy = (Math.random() - 0.5) * 80;
+  }
+  update(dt) {
+    const SEP = 40, PLAYER_F = 100;
+    let sepX = 0, sepY = 0;
+    for (let i = 0; i < enemies.length; i++) {
+      const n = enemies[i];
+      if (n === this || !(n instanceof ShuttleSmall) || !n.active) continue;
+      const d = dist(this.x, this.y, n.x, n.y);
+      if (d < SEP && d > 0) {
+        sepX += (this.x - n.x) / d * (SEP - d);
+        sepY += (this.y - n.y) / d * (SEP - d);
+      }
+    }
+    const pd = dist(this.x, this.y, player.x, player.y);
+    const pFX = pd > 0 ? (player.x - this.x) / pd * PLAYER_F : 0;
+    const pFY = pd > 0 ? (player.y - this.y) / pd * PLAYER_F : 0;
+    this.vx += (sepX * 0.2 + pFX) * dt;
+    this.vy += (sepY * 0.2 + pFY) * dt;
+    const spd = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
+    if (spd > 200) { this.vx = this.vx / spd * 200; this.vy = this.vy / spd * 200; }
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+  }
+  onDeath() {}
+  draw() {
+    // Small shuttle: vertical diamond outline with soft purple bloom
+    const SY = this.radius;
+    const SX = SY * 0.45;
+    const pulse = 0.9 + 0.1 * Math.sin(Date.now() * 0.003);
+    drawDiamondShape(this.x, this.y, SX+10, SY+10, null, `rgba(160,0,255,${0.08*pulse})`, SX*1.2, 50);
+    drawDiamondShape(this.x, this.y, SX+4,  SY+4,  null, `rgba(180,0,255,${0.25*pulse})`, 3, 25);
+    drawDiamondShape(this.x, this.y, SX,    SY,    null, '#CC00FF', 1.5, 10);
+    drawDiamondShape(this.x, this.y, SX*0.85, SY*0.85, null, `rgba(220,100,255,${0.3*pulse})`, 0.8, 6);
+  }
+}
+
+// ── ShuttleLarge ──────────────────────────────────────────────
+class ShuttleLarge {
+  constructor(x, y) {
+    this.x = x; this.y = y;
+    this.radius = 50;
+    this.hp     = 15;
+    this.active = true;
+    const cx = canvas.width / 2, cy = canvas.height / 2;
+    this.R0    = dist(x, y, cx, cy);
+    this.angle = Math.atan2(y - cy, x - cx);
+    this.omega = -0.5;  // negative = clockwise in canvas coords
+    this.v_in  = 20;    // inward speed px/s
+    this.t     = 0;
+    this.spawnTimer        = 0;
+    this.nutrientDropTimer = 0;
+    // EKG spike state for visual
+    this._spikes = [];
+    this._spikeTimer = 0;
+    this._nextSpike = 0.8;
+    this._spikeIntensity = 0;
+  }
+  update(dt) {
+    this.t += dt;
+    this.spawnTimer        += dt;
+    this.nutrientDropTimer += dt;
+    // EKG spikes
+    this._spikeTimer += dt;
+    if (this._spikeTimer >= this._nextSpike) {
+      this._spikes.push({ amp: 0.6+Math.random()*0.4, decay: 10+Math.random()*10, t: 0 });
+      this._nextSpike = 0.5+Math.random()*1.6; this._spikeTimer = 0;
+    }
+    let intensity = 0;
+    for (let i = this._spikes.length-1; i >= 0; i--) {
+      this._spikes[i].t += dt;
+      intensity += this._spikes[i].amp * Math.exp(-this._spikes[i].decay * this._spikes[i].t);
+      if (this._spikes[i].t > 0.8) this._spikes.splice(i, 1);
+    }
+    this._spikeIntensity = Math.min(1, intensity);
+    // Archimedean spiral: r shrinks over time, clockwise rotation
+    let r = this.R0 - this.v_in * this.t;
+    if (r < this.radius + 10) {
+      // Reached center — respawn at edge and restart spiral
+      const a = Math.random() * Math.PI * 2;
+      const ex = canvas.width  / 2 + Math.cos(a) * (canvas.width  / 2 - 80);
+      const ey = canvas.height / 2 + Math.sin(a) * (canvas.height / 2 - 80);
+      this.R0    = dist(ex, ey, canvas.width / 2, canvas.height / 2);
+      this.angle = Math.atan2(ey - canvas.height / 2, ex - canvas.width / 2);
+      this.t     = 0;
+      r = this.R0;
+    }
+    const cx = canvas.width / 2, cy = canvas.height / 2;
+    this.x = cx + r * Math.cos(this.omega * this.t + this.angle);
+    this.y = cy + r * Math.sin(this.omega * this.t + this.angle);
+    if (this.spawnTimer >= 5) {
+      this.spawnTimer = 0;
+      const count = 2 + Math.floor(Math.random() * 2); // 2 or 3
+      for (let k = 0; k < count; k++) {
+        enemies.push(new ShuttleSmall(this.x, this.y));
+      }
+    }
+    if (this.nutrientDropTimer >= 60) {
+      this.nutrientDropTimer = 0;
+      nutrients.push(new Nutrient(this.x, this.y));
+    }
+  }
+  onDeath() {
+    nutrients.push(new Nutrient(this.x, this.y));
+  }
+  draw() {
+    // Large shuttle: vertical diamond with EKG inner layers + trail
+    const SY = this.radius;
+    const SX = SY * 0.45;
+    const intensity = this._spikeIntensity || 0;
+    // Inner layers
+    for (let l = 6; l >= 1; l--) {
+      const frac = l / 6;
+      const baseA = 0.08 + frac * 0.10;
+      const alpha = baseA + intensity * (0.55 - baseA);
+      drawDiamondShape(this.x, this.y, SX*frac*0.85, SY*frac*0.85,
+        `rgba(140,0,255,${alpha})`, `rgba(180,0,255,${alpha+0.1})`, 0.8, 8);
+    }
+    // Outer bloom
+    drawDiamondShape(this.x, this.y, SX+8, SY+8, null, 'rgba(160,0,255,0.12)', 12, 50);
+    drawDiamondShape(this.x, this.y, SX,   SY,   null, 'rgba(180,0,255,0.45)', 3, 22);
+    drawDiamondShape(this.x, this.y, SX,   SY,   null, '#CC00FF', 1.5, 10);
+    if (intensity > 0.3) {
+      drawDiamondShape(this.x, this.y, SX+intensity*6, SY+intensity*6,
+        null, `rgba(255,150,255,${intensity*0.7})`, 2, 40);
+    }
+  }
+}
+
+// ── Devourer ──────────────────────────────────────────────────
+// Snake-like entity: head uses sine-wave tracking, body segments follow
+class Devourer {
+  constructor(x, y) {
+    this.radius  = 80;   // 8x player
+    this.hp      = 30;
+    this.active  = true;
+    this.color   = '#00FF00';
+    // Head position
+    this.x = x; this.y = y;
+    this.vx = 0; this.vy = 0;
+    // Sine-wave motion state
+    this.t       = 0;
+    this.v_base  = 90;   // px/s toward player
+    this.amp     = 70;   // sine amplitude px
+    this.freq    = 0.6;  // Hz
+    // Body: history of head positions
+    this.history = [];
+    this.segCount = 24;  // same as preview
+    this.segDelay = 4;   // 4 distance-records between segments = 32px spacing
+    this._lastRecordX = x;
+    this._lastRecordY = y;
+  }
+
+  update(dt) {
+    this.t += dt;
+    // Direction toward player
+    const dx = player.x - this.x, dy = player.y - this.y;
+    const d  = Math.sqrt(dx * dx + dy * dy);
+    if (d === 0) return;
+    const nx = dx / d, ny = dy / d;
+    // Perpendicular for sine wave
+    const perpX = -ny, perpY = nx;
+    // Pure sine wave: head moves forward + sine offset perpendicular
+    // No derivative jitter — just smooth sine displacement
+    const sineOffset = this.amp * Math.sin(2 * Math.PI * this.freq * this.t);
+    this.x += nx * this.v_base * dt + perpX * sineOffset * dt * 2;
+    this.y += ny * this.v_base * dt + perpY * sineOffset * dt * 2;
+    // Record history by distance (every 4px moved) for tight overlap
+    const dMoved = Math.sqrt(
+      (this.x - this._lastRecordX) ** 2 + (this.y - this._lastRecordY) ** 2
+    );
+    if (dMoved >= 4) {
+      this.history.unshift({ x: this.x, y: this.y });
+      this._lastRecordX = this.x;
+      this._lastRecordY = this.y;
+      const maxLen = this.segCount * this.segDelay + 10;
+      if (this.history.length > maxLen) this.history.length = maxLen;
+    }
+  }
+
+  onDeath() {
+    for (let k = 0; k < 2; k++) {
+      nutrients.push(new Nutrient(
+        this.x + (Math.random() - 0.5) * 30,
+        this.y + (Math.random() - 0.5) * 30
+      ));
+    }
+  }
+
+  draw() {
+    // Devourer: multi-segment snake, head=22px, tail=4px (same as preview)
+    const HEAD_R = 22;
+    const TAIL_R = 4;
+    for (let s = this.segCount - 1; s >= 0; s--) {
+      const idx = s * this.segDelay;
+      if (idx >= this.history.length) continue;
+      const pos = this.history[idx];
+      const t   = s / (this.segCount - 1);
+      const r   = HEAD_R * (1 - t) + TAIL_R * t;
+      const alpha = 1 - t * 0.5;
+      drawDevourerSegment(pos.x, pos.y, r, alpha);
+    }
+    drawDevourerSegment(this.x, this.y, HEAD_R, 1);
+  }
+}
+
+// ── Jellyfish ─────────────────────────────────────────────────
+class Jellyfish {
+  constructor(x, y) {
+    this.x = x; this.y = y;
+    this.radius     = 100;  // 10x player
+    this.baseRadius = 100;
+    this.hp         = 50;
+    this.active     = true;
+    this.color      = '#00FFFF';
+    this.t          = 0;
+    this.T          = 3;      // pulse period seconds
+    this.V_max      = 380;    // peak speed px/s
+    this.lambda     = 1.8;    // damping
+    // Direction locked at pulse start
+    this.dirX = 0; this.dirY = 0;
+  }
+
+  update(dt) {
+    this.t += dt;
+    const t_mod = this.t % this.T;
+    // At pulse start, lock direction toward player
+    if (t_mod < dt * 1.5) {
+      const dx = player.x - this.x, dy = player.y - this.y;
+      const d  = Math.sqrt(dx * dx + dy * dy);
+      if (d > 0) { this.dirX = dx / d; this.dirY = dy / d; }
+    }
+    const spd = this.V_max * Math.exp(-this.lambda * t_mod);
+    this.x += this.dirX * spd * dt;
+    this.y += this.dirY * spd * dt;
+    // Visual scale: contract at pulse, expand during glide
+    const pulseFrac = t_mod / this.T;
+    if (pulseFrac < 0.1) {
+      this.radius = this.baseRadius * (0.6 + pulseFrac / 0.1 * 0.4);
+    } else {
+      this.radius = this.baseRadius;
+    }
+  }
+
+  onDeath() {
+    for (let k = 0; k < 3; k++) {
+      nutrients.push(new Nutrient(
+        this.x + (Math.random() - 0.5) * 40,
+        this.y + (Math.random() - 0.5) * 40
+      ));
+    }
+  }
+
+  draw() {
+    // Jellyfish: pentagon head + 5 tentacles
+    const r = this.radius * 0.55; // pentagon circumradius scaled to entity radius
+    const pulse = r * (1 + 0.04 * Math.sin(this.t * 2.1));
+    const pts = [];
+    for (let i = 0; i < 5; i++) {
+      const a = -Math.PI/2 + (i/5)*Math.PI*2;
+      pts.push({ x: this.x + Math.cos(a)*pulse, y: this.y + Math.sin(a)*pulse });
+    }
+    // Pentagon bloom layers
+    ctx.save(); ctx.shadowBlur=35; ctx.shadowColor='#00FFFF';
+    ctx.strokeStyle='rgba(0,255,255,0.15)'; ctx.lineWidth=10;
+    ctx.beginPath(); pts.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y)); ctx.closePath(); ctx.stroke(); ctx.restore();
+    ctx.save(); ctx.shadowBlur=18; ctx.shadowColor='#00FFFF';
+    ctx.strokeStyle='rgba(0,255,255,0.45)'; ctx.lineWidth=2.5;
+    ctx.beginPath(); pts.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y)); ctx.closePath(); ctx.stroke(); ctx.restore();
+    ctx.save(); ctx.shadowBlur=8; ctx.shadowColor='#00FFFF';
+    ctx.strokeStyle='#00FFFF'; ctx.lineWidth=1.2;
+    ctx.beginPath(); pts.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y)); ctx.closePath(); ctx.stroke(); ctx.restore();
+    // Tentacles
+    const TENT_SEGS = 6, TENT_LEN = this.radius * 0.38;
+    for (let i = 0; i < 5; i++) {
+      const v = pts[i];
+      const outAngle = Math.atan2(v.y - this.y, v.x - this.x);
+      let tx = v.x, ty = v.y;
+      for (let s = 0; s < TENT_SEGS; s++) {
+        const prog = s / TENT_SEGS;
+        const swing = 0.45*(1-prog*0.5)*Math.sin(this.t*1.8 + i*1.3 + s*0.7);
+        const sa = outAngle + swing;
+        const nx2 = tx + Math.cos(sa)*TENT_LEN, ny2 = ty + Math.sin(sa)*TENT_LEN;
+        const alpha = 0.8 - prog*0.5;
+        jfGline(tx,ty,nx2,ny2, Math.max(0.5,1.5-prog*0.8), 12-prog*6, alpha);
+        jfGcircle(nx2,ny2, s<TENT_SEGS-1?2.5-prog*1.5:3, alpha*0.7);
+        tx=nx2; ty=ny2;
+      }
+    }
+  }
+}
+
+// ── Leviathan ─────────────────────────────────────────────────
+// Uses 2D curl noise (finite-difference Simplex approximation) + player drift
+class Leviathan {
+  constructor(x, y) {
+    this.x = x; this.y = y;
+    this.radius = 150;  // 15x player
+    this.hp     = 80;
+    this.active = true;
+    this.color  = '#FF0000';
+    this.vx = 0; this.vy = 0;
+    this.noiseOffset = Math.random() * 1000;
+    this.speed  = 60;
+    this.alpha  = 0.2;
+    this._lt    = 0;
+    this._orbs  = null;
+  }
+
+  _noise(x, y) {
+    const X = Math.floor(x), Y = Math.floor(y);
+    const fx = x - X, fy = y - Y;
+    const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy);
+    const h = (n) => {
+      let s = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+      return s - Math.floor(s);
+    };
+    return h(X + Y * 57) * (1-u) * (1-v)
+         + h(X+1 + Y * 57) * u * (1-v)
+         + h(X + (Y+1) * 57) * (1-u) * v
+         + h(X+1 + (Y+1) * 57) * u * v;
+  }
+
+  update(dt) {
+    const scale = 0.0008;
+    const eps   = 1.0;
+    const nx = this.x * scale + this.noiseOffset;
+    const ny = this.y * scale + this.noiseOffset;
+    // Curl: dN/dy, -dN/dx
+    const curlX =  (this._noise(nx, ny + eps) - this._noise(nx, ny - eps)) / (2 * eps);
+    const curlY = -(this._noise(nx + eps, ny) - this._noise(nx - eps, ny)) / (2 * eps);
+    // Direction toward player
+    const dx = player.x - this.x, dy = player.y - this.y;
+    const d  = Math.sqrt(dx * dx + dy * dy);
+    const pX = d > 0 ? dx / d : 0, pY = d > 0 ? dy / d : 0;
+    // Blend
+    const finalX = (1 - this.alpha) * curlX + this.alpha * pX;
+    const finalY = (1 - this.alpha) * curlY + this.alpha * pY;
+    const mag = Math.sqrt(finalX * finalX + finalY * finalY);
+    if (mag > 0) {
+      this.vx = finalX / mag * this.speed;
+      this.vy = finalY / mag * this.speed;
+    }
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+    this._lt += dt;
+  }
+
+  onDeath() {
+    for (let k = 0; k < 5; k++) {
+      nutrients.push(new Nutrient(
+        this.x + (Math.random() - 0.5) * 60,
+        this.y + (Math.random() - 0.5) * 60
+      ));
+    }
+  }
+
+  draw() {
+    // Leviathan: layered wavy wings + beak + trailing orbs
+    const lx = this.x, ly = this.y;
+    // Core red halo
+    ctx.save(); ctx.shadowBlur=80; ctx.shadowColor='rgba(255,50,50,0.7)';
+    ctx.fillStyle='rgba(255,80,80,0.08)'; ctx.beginPath(); ctx.arc(lx,ly,this.radius*0.6,0,Math.PI*2); ctx.fill(); ctx.restore();
+    // Layered wings
+    const LAYERS=7, lt=this._lt||0;
+    for (let l=0;l<LAYERS;l++) {
+      const frac=l/LAYERS;
+      const w=this.radius*(0.9+frac*0.4), h=this.radius*(0.33+frac*0.2);
+      const angle=(frac-0.5)*0.6+Math.sin(lt*1.2+l*0.5)*0.15;
+      const waveA=8+frac*6, waveF=2+frac*1.5, phase=lt*1.5+l*0.8;
+      const alpha=0.12+frac*0.18;
+      const r2=160+frac*60, g2=Math.max(0,80-frac*30), b2=Math.max(0,50-frac*20);
+      ctx.save(); ctx.translate(lx,ly); ctx.rotate(angle);
+      ctx.shadowBlur=35; ctx.shadowColor=`rgba(${r2},${g2},${b2},0.5)`;
+      ctx.fillStyle=`rgba(${r2},${g2},${b2},${alpha})`; ctx.globalAlpha=1;
+      ctx.beginPath();
+      for(let i=0;i<=20;i++){const f=i/20;const x=-w/2+f*w;const wave=waveA*Math.sin(f*waveF*Math.PI*2+phase);if(i===0)ctx.moveTo(x,-h/2+wave);else ctx.lineTo(x,-h/2+wave);}
+      for(let i=20;i>=0;i--){const f=i/20;const x=-w/2+f*w;const wave=waveA*Math.sin(f*waveF*Math.PI*2+phase+Math.PI);ctx.lineTo(x,h/2+wave);}
+      ctx.closePath(); ctx.fill(); ctx.restore();
+    }
+    // Beak
+    const bx=lx-this.radius*0.47, bTipX=bx-this.radius*0.3;
+    ctx.save(); ctx.shadowBlur=25; ctx.shadowColor='rgba(255,100,100,0.8)';
+    ctx.strokeStyle='rgba(220,120,100,0.6)'; ctx.lineWidth=12; ctx.lineCap='round';
+    ctx.beginPath(); ctx.moveTo(bx,ly); ctx.lineTo(bTipX,ly); ctx.stroke(); ctx.restore();
+    ctx.save(); ctx.shadowBlur=10; ctx.shadowColor='#FF6666';
+    ctx.strokeStyle='#FF8888'; ctx.lineWidth=2; ctx.lineCap='round';
+    ctx.beginPath(); ctx.moveTo(bx,ly); ctx.lineTo(bTipX,ly); ctx.stroke(); ctx.restore();
+    // Trailing orbs
+    if (!this._orbs) {
+      this._orbs=[];
+      for(let i=0;i<8;i++) this._orbs.push({ox:50+i*15+Math.random()*12,oy:(Math.random()-0.5)*40,r:3+Math.random()*4,phase:Math.random()*Math.PI*2,isSpike:Math.random()<0.4});
+    }
+    for(const orb of this._orbs){
+      const ox2=lx+orb.ox+Math.sin(lt*1.5+orb.phase)*8;
+      const oy2=ly+orb.oy+Math.cos(lt*1.8+orb.phase)*6;
+      if(orb.isSpike){
+        const sa=orb.phase+lt*0.5, sl=12;
+        ctx.save(); ctx.shadowBlur=12; ctx.shadowColor='rgba(255,80,60,0.7)';
+        ctx.strokeStyle='rgba(220,100,80,0.5)'; ctx.lineWidth=2; ctx.lineCap='round';
+        ctx.beginPath(); ctx.moveTo(ox2,oy2); ctx.lineTo(ox2+Math.cos(sa)*sl,oy2+Math.sin(sa)*sl); ctx.stroke(); ctx.restore();
+      } else {
+        ctx.save(); ctx.shadowBlur=18; ctx.shadowColor='rgba(255,100,80,0.8)';
+        ctx.fillStyle='rgba(200,90,70,0.6)'; ctx.beginPath(); ctx.arc(ox2,oy2,orb.r,0,Math.PI*2); ctx.fill(); ctx.restore();
+        ctx.save(); ctx.shadowBlur=8; ctx.shadowColor='#FF9988';
+        ctx.fillStyle='rgba(255,150,130,0.8)'; ctx.beginPath(); ctx.arc(ox2,oy2,orb.r*0.5,0,Math.PI*2); ctx.fill(); ctx.restore();
+      }
+    }
+  }
+}
+
+// ── Timeline ──────────────────────────────────────────────────
+let devourerSpawnTimer  = 0;
+let jellyfishSpawnTimer = 0;
+let leviathanSpawnTimer = 0;
+
+function spawnOffscreen(cls) {
+  const side = Math.floor(Math.random() * 4);
+  let x, y;
+  if (side === 0) { x = Math.random() * canvas.width; y = -150; }
+  else if (side === 1) { x = canvas.width + 150; y = Math.random() * canvas.height; }
+  else if (side === 2) { x = Math.random() * canvas.width; y = canvas.height + 150; }
+  else { x = -150; y = Math.random() * canvas.height; }
+  enemies.push(new cls(x, y));
+}
+
+function updateTimeline(dt) {
+  const t1 = DEV_MODE ? 60  : 180;  // Devourer:  dev=1min, prod=3min
+  const t2 = DEV_MODE ? 120 : 360;  // Jellyfish: dev=2min, prod=6min
+  const t3 = DEV_MODE ? 180 : 540;  // Leviathan: dev=3min, prod=9min
+  if (survivalTime >= t1) {
+    devourerSpawnTimer += dt;
+    if (devourerSpawnTimer >= 20) { devourerSpawnTimer = 0; spawnOffscreen(Devourer); }
+  }
+  if (survivalTime >= t2) {
+    jellyfishSpawnTimer += dt;
+    if (jellyfishSpawnTimer >= 25) { jellyfishSpawnTimer = 0; spawnOffscreen(Jellyfish); }
+  }
+  if (survivalTime >= t3) {
+    leviathanSpawnTimer += dt;
+    if (leviathanSpawnTimer >= 40) { leviathanSpawnTimer = 0; spawnOffscreen(Leviathan); }
+  }
+}
+
+function initTimeline() {
+  devourerSpawnTimer  = 0;
+  jellyfishSpawnTimer = 0;
+  leviathanSpawnTimer = 0;
+  const count = 4 + Math.floor(Math.random() * 2);
+  for (let i = 0; i < count; i++) {
+    const a  = (i / count) * Math.PI * 2;
+    const ex = canvas.width  / 2 + Math.cos(a) * (canvas.width  / 2 - 120);
+    const ey = canvas.height / 2 + Math.sin(a) * (canvas.height / 2 - 120);
+    enemies.push(new ShuttleLarge(ex, ey));
+  }
+}
+
+// ── Input ─────────────────────────────────────────────────────
+canvas.addEventListener('mousemove', e => { mouseX = e.clientX; mouseY = e.clientY; });
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('mouseup', e => mouseButtons.delete(e.button));
+
+canvas.addEventListener('mousedown', e => {
+  e.preventDefault();
+  if (gameState !== 'RUNNING') return;
+  mouseButtons.add(e.button);
+
+  const dx = mouseX - player.x, dy = mouseY - player.y;
+  const d  = Math.sqrt(dx * dx + dy * dy);
+  if (d === 0) return;
+  const nx = dx / d, ny = dy / d;
+  const dmg = 1 + Math.floor(player.nutrientCount / 10);
+
+  if (e.button === 0) {
+    // Single shot
+    player.firedThisFrame = true;
+    spores.push(new Spore(player.x, player.y, nx * 600, ny * 600, dmg));
+
+  } else if (e.button === 2) {
+    // Shotgun: 4 pellets in a cone
+    const canFire = player.aoeCooldown <= 0 || player.frenzyTimer > 0;
+    if (canFire) {
+      player.firedThisFrame = true;
+      const baseAngle = Math.atan2(ny, nx);
+      const spreads   = [-0.22, -0.07, 0.07, 0.22];
+      for (let k = 0; k < 4; k++) {
+        const a = baseAngle + spreads[k];
+        spores.push(new Spore(
+          player.x, player.y,
+          Math.cos(a) * 550, Math.sin(a) * 550,
+          dmg
+        ));
+      }
+      if (player.frenzyTimer <= 0) player.aoeCooldown = 3;
+    }
+  }
+});
+
+window.addEventListener('keydown', e => {
+  if (e.key.toLowerCase() === 'r' && gameState === 'GAME_OVER') resetGame();
+});
+
+// ── Reset ─────────────────────────────────────────────────────
+function resetGame() {
+  spores.length     = 0;
+  aoeFlashes.length = 0;
+  explosions.length = 0;
+  nutrients.length  = 0;
+  enemies.length    = 0;
+  survivalTime      = 0;
+  ceasefireTimer    = 0;
+  attracting        = false;
+  gameState         = 'RUNNING';
+  mouseButtons.clear();
+  player.init();
+  initTimeline();
+  initBgParticles();
+}
+
+// ── Game Loop ─────────────────────────────────────────────────
+function gameLoop(ts) {
+  const rawDt = Math.min((ts - lastTime) / 1000, 0.05);
+  const dt    = DEV_MODE ? rawDt * devTimeScale : rawDt;
+  lastTime = ts;
+
+  // Clear
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  if (gameState === 'RUNNING') {
+    survivalTime += dt;
+    updateTimeline(dt);
+
+    // Background particles
+    updateBgParticles(dt);
+    drawBgParticles();
+
+    // Player
+    player.update(dt);
+    player.draw();
+
+    // ── Gravity field (ceasefire mechanic) ────────────────────
+    const isFiringNow = player.firedThisFrame || mouseButtons.size > 0;
+    player.firedThisFrame = false;
+
+    if (!attracting) {
+      if (isFiringNow) {
+        ceasefireTimer = 0;
+      } else {
+        ceasefireTimer += dt;
+        if (ceasefireTimer >= GRAVITY_WINDOW) {
+          attracting = true;
+        }
+      }
+    }
+
+    // ── Nutrients: update age first, then apply gravity, then draw ──
+    for (let i = nutrients.length - 1; i >= 0; i--) {
+      const n = nutrients[i];
+      n.age += dt;
+      if (n.age >= NUTRIENT_LIFE) {
+        n.active = false;
+        nutrients.splice(i, 1);
+        continue;
+      }
+      // Apply gravity if attracting
+      if (attracting) {
+        const d = dist(player.x, player.y, n.x, n.y);
+        if (d < player.radius + n.radius + 2) {
+          // Absorbed
+          n.active = false;
+          nutrients.splice(i, 1);
+          player.nutrientCount++;
+          player.frenzyTimer = 5;
+          player.aoeCooldown = 0;
+          continue;
+        } else {
+          // Pull toward player, speed ramps up over time
+          const spd = Math.min(120 + (ceasefireTimer) * 40, 500);
+          n.vx = (player.x - n.x) / d * spd;
+          n.vy = (player.y - n.y) / d * spd;
+        }
+      } else {
+        // Not attracting: keep still
+        n.vx = 0;
+        n.vy = 0;
+      }
+      n.x += n.vx * dt;
+      n.y += n.vy * dt;
+      // Draw
+      const alpha = Math.max(0, 1 - n.age / NUTRIENT_LIFE);
+      if (alpha > 0) {
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        drawRing(n.x, n.y, n.radius, '#FFFF00', 18, 2);
+        ctx.restore();
+      }
+    }
+
+    // Reset attracting once all nutrients are gone
+    if (attracting && nutrients.length === 0) {
+      attracting     = false;
+      ceasefireTimer = 0;
+    }
+
+    // ── Enemies ───────────────────────────────────────────────
+    for (let i = enemies.length - 1; i >= 0; i--) {
+      enemies[i].update(dt);
+      if (!enemies[i].active) { enemies.splice(i, 1); continue; }
+      enemies[i].draw();
+    }
+
+    // ── Spore vs enemy ────────────────────────────────────────
+    for (let i = spores.length - 1; i >= 0; i--) {
+      if (!spores[i].active) continue;
+      for (let j = enemies.length - 1; j >= 0; j--) {
+        if (!enemies[j].active) continue;
+        if (circlesOverlap(spores[i], enemies[j])) {
+          enemies[j].hp -= spores[i].damage;
+          spores[i].active = false;
+          if (enemies[j].hp <= 0) {
+            enemies[j].onDeath();
+            enemies[j].active = false;
+          }
+          break;
+        }
+      }
+    }
+
+    // ── AOE explosions ────────────────────────────────────────
+    for (let i = explosions.length - 1; i >= 0; i--) {
+      const ex = explosions[i];
+      for (let j = enemies.length - 1; j >= 0; j--) {
+        if (!enemies[j].active) continue;
+        if (dist(enemies[j].x, enemies[j].y, ex.x, ex.y) < ex.r + enemies[j].radius) {
+          enemies[j].hp -= ex.dmg;
+          if (enemies[j].hp <= 0) {
+            enemies[j].onDeath();
+            enemies[j].active = false;
+          }
+        }
+      }
+      explosions.splice(i, 1);
+    }
+
+    // ── Enemy vs player ───────────────────────────────────────
+    if (!DEV_MODE) {
+      for (let i = 0; i < enemies.length; i++) {
+        if (!enemies[i].active) continue;
+        if (circlesOverlap(enemies[i], player)) { gameState = 'GAME_OVER'; break; }
+      }
+    }
+
+    // ── Spores ────────────────────────────────────────────────
+    for (let i = spores.length - 1; i >= 0; i--) {
+      spores[i].update(dt);
+      if (!spores[i].active) { spores.splice(i, 1); continue; }
+      spores[i].draw();
+    }
+
+    // ── AOE flashes ───────────────────────────────────────────
+    for (let i = aoeFlashes.length - 1; i >= 0; i--) {
+      const f = aoeFlashes[i];
+      f.t -= dt;
+      if (f.t <= 0) { aoeFlashes.splice(i, 1); continue; }
+      ctx.save();
+      ctx.globalAlpha = (f.t / 0.3) * 0.4;
+      ctx.strokeStyle = '#FF8800';
+      ctx.shadowBlur  = 30;
+      ctx.shadowColor = '#FF8800';
+      ctx.lineWidth   = 2;
+      ctx.beginPath();
+      ctx.arc(f.x, f.y, f.r, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // ── HUD ───────────────────────────────────────────────────
+    const mm = String(Math.floor(survivalTime / 60)).padStart(2, '0');
+    const ss = String(Math.floor(survivalTime % 60)).padStart(2, '0');
+    ctx.save();
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font      = '20px monospace';
+    ctx.fillText(mm + ':' + ss, 20, 36);
+    // Ceasefire indicator
+    if (attracting) {
+      ctx.fillStyle = '#00FF88';
+      ctx.font      = '14px monospace';
+      ctx.fillText('ATTRACTING', 20, 56);
+    } else if (ceasefireTimer > 0) {
+      ctx.fillStyle = '#FFFF00';
+      ctx.font      = '14px monospace';
+      ctx.fillText('CEASEFIRE ' + Math.ceil(GRAVITY_WINDOW - ceasefireTimer) + 's', 20, 56);
+    }
+    ctx.restore();
+
+  } else {
+    // ── Game Over ─────────────────────────────────────────────
+    const mm = String(Math.floor(survivalTime / 60)).padStart(2, '0');
+    const ss = String(Math.floor(survivalTime % 60)).padStart(2, '0');
+    ctx.save();
+    ctx.fillStyle   = '#FFFFFF';
+    ctx.shadowBlur  = 20;
+    ctx.shadowColor = '#FFFFFF';
+    ctx.font        = 'bold 48px monospace';
+    ctx.textAlign   = 'center';
+    ctx.fillText('GAME OVER', canvas.width / 2, canvas.height / 2 - 40);
+    ctx.font = '24px monospace';
+    ctx.fillText('Survived: ' + mm + ':' + ss, canvas.width / 2, canvas.height / 2 + 10);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle  = '#888888';
+    ctx.font       = '18px monospace';
+    ctx.fillText('Press R to restart', canvas.width / 2, canvas.height / 2 + 50);
+    ctx.restore();
+  }
+
+  requestAnimationFrame(gameLoop);
+}
+
+// ── Start ─────────────────────────────────────────────────────
+player.init();
+initTimeline();
+initBgParticles();
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
