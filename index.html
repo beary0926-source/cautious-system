@@ -842,9 +842,9 @@ function spawnOffscreen(cls) {
 }
 
 function updateTimeline(dt) {
-  const t1 = DEV_MODE ? 60  : 180;  // Devourer:  dev=1min, prod=3min
-  const t2 = DEV_MODE ? 120 : 360;  // Jellyfish: dev=2min, prod=6min
-  const t3 = DEV_MODE ? 180 : 540;  // Leviathan: dev=3min, prod=9min
+  const t1 = DEV_MODE ? 60  : 60;   // Devourer:  1min
+  const t2 = DEV_MODE ? 120 : 120;  // Jellyfish: 2min
+  const t3 = DEV_MODE ? 180 : 180;  // Leviathan: 3min
   if (survivalTime >= t1) {
     devourerSpawnTimer += dt;
     if (devourerSpawnTimer >= 20) { devourerSpawnTimer = 0; spawnOffscreen(Devourer); }
